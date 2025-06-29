@@ -75,7 +75,7 @@ struct icmphdr create_icmp_echo_request(uint16_t id, uint16_t sequence) {
     return packet;
 }
 
-// 
+// пинг и получение ethernet-фрейма
 std::vector<uint8_t> send_icmp_and_capture_ethernet(const PingConfig& config, const Socket& icmp_socket, const Socket& raw_socket) {
     struct timeval tv {
         .tv_sec = config.timeout_sec,
@@ -100,7 +100,7 @@ std::vector<uint8_t> send_icmp_and_capture_ethernet(const PingConfig& config, co
         throw std::runtime_error("Failed to send ICMP request");
     }
 
-    // полученаем ethernet-фрейм
+    // получаем ethernet-фрейм
     std::vector<uint8_t> buffer(BUFFER_SIZE);
     struct sockaddr_ll src_addr {};
     socklen_t addr_len = sizeof(src_addr);
