@@ -13,6 +13,10 @@
 #include <linux/if_packet.h>
 #include <sys/ioctl.h>
 #include <net/if.h>
+#include <vector>
+
+constexpr int MAC_STR_LENGTH = 18; // XX:XX:XX:XX:XX:XX + '\0' 
+constexpr int BUFFER_SIZE = 1024; 
 
 struct PingConfig {
     std::string target_ip;
@@ -71,64 +75,79 @@ struct icmphdr create_icmp_echo_request(uint16_t id, uint16_t sequence) {
     return packet;
 }
 
-// отправка и получение mac
-std::string ping_and_get_mac(const PingConfig& config) {
-    // raw сокет для отправки ping
-    Socket icmp_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    // raw сокет для получения ethernet фрейма
-    Socket raw_socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-
+// 
+std::vector<uint8_t> send_icmp_and_capture_ethernet(const PingConfig& config, const Socket& icmp_socket, const Socket& raw_socket) {
     struct timeval tv {
         .tv_sec = config.timeout_sec,
         .tv_usec = 0
     };
-
-
+    
     if (setsockopt(raw_socket.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         throw std::runtime_error("Failed to set socket timeout");
     }
-    
-    // структура для Ipv4 адреса
+
+    // адрес назначения
     struct sockaddr_in dest_addr {};
     dest_addr.sin_family = AF_INET;
     if (inet_pton(AF_INET, config.target_ip.c_str(), &dest_addr.sin_addr) != 1) {
-        throw::std::runtime_error("Invalid IP address");
+        throw std::runtime_error("Invalid IP address");
     }
-    
-    // отправка icmp запроса
+
+    // отправка icmp
     auto icmp_packet = create_icmp_echo_request(config.packet_id, 1);
     if (sendto(icmp_socket.get(), &icmp_packet, sizeof(icmp_packet), 0,
-    reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr)) < 0) {
+              reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr)) < 0) {
         throw std::runtime_error("Failed to send ICMP request");
     }
 
-    // получение ethernet-фрейма с mac адресом
-    char buffer[1024];
+    // полученаем ethernet-фрейм
+    std::vector<uint8_t> buffer(BUFFER_SIZE);
     struct sockaddr_ll src_addr {};
     socklen_t addr_len = sizeof(src_addr);
-    ssize_t recv_len = recvfrom(raw_socket.get(), buffer, sizeof(buffer), 0, reinterpret_cast<struct sockaddr*>(&src_addr), &addr_len);
+    
+    ssize_t recv_len = recvfrom(raw_socket.get(), buffer.data(), buffer.size(), 0,
+                               reinterpret_cast<struct sockaddr*>(&src_addr), &addr_len);
 
     if (recv_len <= 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             throw std::runtime_error("Timeout: no reply received");
-        } else {
-            throw std::runtime_error("recvfrom failed: " + std::string(strerror(errno)));
         }
+        throw std::runtime_error("recvfrom failed: " + std::string(strerror(errno)));
     }
 
-    // извлекаем mac адрес
-    auto* eth_header = reinterpret_cast<struct ethhdr*>(buffer);
+    buffer.resize(recv_len);
+    return buffer;
+}
+
+
+// извлекаем mac адрес
+std::string extract_mac_from_ethernet(const std::vector<uint8_t>& frame) {
+    if (frame.size() < sizeof(ethhdr)) {
+        throw std::runtime_error("Invalid Ethernet frame size");
+    }
+
+    const auto* eth_header = reinterpret_cast<const struct ethhdr*>(frame.data());
     if (eth_header->h_proto != htons(ETH_P_IP)) {
         throw std::runtime_error("Not an IP packet");
     }
 
-    char mac_str[18];
+    char mac_str[MAC_STR_LENGTH];
     snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-    eth_header->h_source[0], eth_header->h_source[1], eth_header->h_source[2],
-    eth_header->h_source[3], eth_header->h_source[4], eth_header->h_source[5]);
+             eth_header->h_source[0], eth_header->h_source[1],
+             eth_header->h_source[2], eth_header->h_source[3],
+             eth_header->h_source[4], eth_header->h_source[5]);
 
     return std::string(mac_str);
+}
 
+
+// отправка и получение mac
+std::string ping_and_get_mac(const PingConfig& config) {
+    Socket icmp_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    Socket raw_socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    
+    auto frame = send_icmp_and_capture_ethernet(config, icmp_socket, raw_socket);
+    return extract_mac_from_ethernet(frame);
 }
 
 
