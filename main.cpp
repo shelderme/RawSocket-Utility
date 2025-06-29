@@ -15,8 +15,6 @@
 #include <net/if.h>
 #include <vector>
 
-constexpr int MAC_STR_LENGTH = 18; // XX:XX:XX:XX:XX:XX + '\0' 
-constexpr int BUFFER_SIZE = 1024; 
 
 struct PingConfig {
     std::string target_ip;
@@ -24,7 +22,8 @@ struct PingConfig {
     uint16_t packet_id = static_cast<uint16_t>(getpid());
 };
 
-// RAII обертка над сокетами
+
+// RAII обертка для сокетов
 class Socket {
 public:
     Socket(int domain, int type, int protocol) {
@@ -43,6 +42,7 @@ public:
 private:
     int fd_ = -1;
 };
+
 
 // подсчет контрольной суммы
 uint16_t calculate_checksum(const void* data, size_t length) {
@@ -64,6 +64,7 @@ uint16_t calculate_checksum(const void* data, size_t length) {
     
 }
 
+
 // создание icmp пакета
 struct icmphdr create_icmp_echo_request(uint16_t id, uint16_t sequence) {
     struct icmphdr packet {};
@@ -75,10 +76,27 @@ struct icmphdr create_icmp_echo_request(uint16_t id, uint16_t sequence) {
     return packet;
 }
 
-// пинг и получение ethernet-фрейма
-std::vector<uint8_t> send_icmp_and_capture_ethernet(const PingConfig& config, const Socket& icmp_socket, const Socket& raw_socket) {
+
+// отправка пинга
+void send_icmp_request(const PingConfig& config, 
+                      const Socket& icmp_socket,
+                      const struct sockaddr_in& dest_addr) 
+{
+    auto icmp_packet = create_icmp_echo_request(config.packet_id, 1);
+    if (sendto(icmp_socket.get(), &icmp_packet, sizeof(icmp_packet), 0,
+              reinterpret_cast<const struct sockaddr*>(&dest_addr), 
+              sizeof(dest_addr)) < 0) {
+        throw std::runtime_error("Failed to send ICMP request");
+    }
+}
+
+
+// захватываем ethernet-фрейм
+std::vector<uint8_t> capture_ethernet(const Socket& raw_socket, int timeout_sec) {
+    constexpr int BUFFER_SIZE = 1024; 
+
     struct timeval tv {
-        .tv_sec = config.timeout_sec,
+        .tv_sec = timeout_sec,
         .tv_usec = 0
     };
     
@@ -86,27 +104,14 @@ std::vector<uint8_t> send_icmp_and_capture_ethernet(const PingConfig& config, co
         throw std::runtime_error("Failed to set socket timeout");
     }
 
-    // адрес назначения
-    struct sockaddr_in dest_addr {};
-    dest_addr.sin_family = AF_INET;
-    if (inet_pton(AF_INET, config.target_ip.c_str(), &dest_addr.sin_addr) != 1) {
-        throw std::runtime_error("Invalid IP address");
-    }
-
-    // отправка icmp
-    auto icmp_packet = create_icmp_echo_request(config.packet_id, 1);
-    if (sendto(icmp_socket.get(), &icmp_packet, sizeof(icmp_packet), 0,
-              reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr)) < 0) {
-        throw std::runtime_error("Failed to send ICMP request");
-    }
-
-    // получаем ethernet-фрейм
+    // получение фрейма
     std::vector<uint8_t> buffer(BUFFER_SIZE);
     struct sockaddr_ll src_addr {};
     socklen_t addr_len = sizeof(src_addr);
     
     ssize_t recv_len = recvfrom(raw_socket.get(), buffer.data(), buffer.size(), 0,
-                               reinterpret_cast<struct sockaddr*>(&src_addr), &addr_len);
+                               reinterpret_cast<struct sockaddr*>(&src_addr), 
+                               &addr_len);
 
     if (recv_len <= 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -122,6 +127,8 @@ std::vector<uint8_t> send_icmp_and_capture_ethernet(const PingConfig& config, co
 
 // извлекаем mac адрес
 std::string extract_mac_from_ethernet(const std::vector<uint8_t>& frame) {
+    constexpr int MAC_STR_LENGTH = 18; // XX:XX:XX:XX:XX:XX + '\0' 
+
     if (frame.size() < sizeof(ethhdr)) {
         throw std::runtime_error("Invalid Ethernet frame size");
     }
@@ -141,12 +148,25 @@ std::string extract_mac_from_ethernet(const std::vector<uint8_t>& frame) {
 }
 
 
-// отправка и получение mac
-std::string ping_and_get_mac(const PingConfig& config) {
+// основная логика + возврат mac отправителя
+std::string get_mac(const PingConfig& config) {
+
     Socket icmp_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     Socket raw_socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    
-    auto frame = send_icmp_and_capture_ethernet(config, icmp_socket, raw_socket);
+
+    struct sockaddr_in dest_addr {};
+    dest_addr.sin_family = AF_INET;
+    if (inet_pton(AF_INET, config.target_ip.c_str(), &dest_addr.sin_addr) != 1) {
+        throw std::runtime_error("Invalid IP address");
+    }
+
+    // отправялем icmp запрос(пинг)
+    send_icmp_request(config, icmp_socket, dest_addr);
+
+    // захватываем ethernet-фрейм
+    auto frame = capture_ethernet(raw_socket, config.timeout_sec);
+
+    // возвращаем mac-адрес
     return extract_mac_from_ethernet(frame);
 }
 
@@ -160,7 +180,7 @@ int main(int argc, char* argv[]) {
         PingConfig config;
         config.target_ip = argv[1];
 
-        auto mac = ping_and_get_mac(config);
+        auto mac = get_mac(config);
         std::cout << "Source MAC: " << mac << std::endl;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
