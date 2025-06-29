@@ -20,12 +20,12 @@ struct PingConfig {
     uint16_t packet_id = static_cast<uint16_t>(getpid());
 };
 
+// RAII обертка над сокетами
 class Socket {
 public:
     Socket(int domain, int type, int protocol) {
         fd_ = socket(domain, type, protocol);
         if (fd_ < 0) {
-            perror("socket (AF_PACKET)");
             throw std::runtime_error("Failed to create socket");
         }
         
@@ -40,6 +40,7 @@ private:
     int fd_ = -1;
 };
 
+// подсчет контрольной суммы
 uint16_t calculate_checksum(const void* data, size_t length) {
     const uint16_t* ptr = reinterpret_cast<const uint16_t*>(data);
     uint32_t sum = 0;
@@ -59,6 +60,7 @@ uint16_t calculate_checksum(const void* data, size_t length) {
     
 }
 
+// создание icmp пакета
 struct icmphdr create_icmp_echo_request(uint16_t id, uint16_t sequence) {
     struct icmphdr packet {};
     packet.type = ICMP_ECHO;
@@ -69,12 +71,12 @@ struct icmphdr create_icmp_echo_request(uint16_t id, uint16_t sequence) {
     return packet;
 }
 
+// отправка и получение mac
 std::string ping_and_get_mac(const PingConfig& config) {
+    // raw сокет для отправки ping
     Socket icmp_socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-    std::cout << icmp_socket.get() << std::endl;
+    // raw сокет для получения ethernet фрейма
     Socket raw_socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    std::cout << raw_socket.get() << std::endl;
-
 
     struct timeval tv {
         .tv_sec = config.timeout_sec,
@@ -82,35 +84,50 @@ std::string ping_and_get_mac(const PingConfig& config) {
     };
 
 
-
-    setsockopt(raw_socket.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    if (setsockopt(raw_socket.get(), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        throw std::runtime_error("Failed to set socket timeout");
+    }
     
-
+    // структура для Ipv4 адреса
     struct sockaddr_in dest_addr {};
     dest_addr.sin_family = AF_INET;
     if (inet_pton(AF_INET, config.target_ip.c_str(), &dest_addr.sin_addr) != 1) {
         throw::std::runtime_error("Invalid IP address");
     }
     
-
+    // отправка icmp запроса
     auto icmp_packet = create_icmp_echo_request(config.packet_id, 1);
     if (sendto(icmp_socket.get(), &icmp_packet, sizeof(icmp_packet), 0,
     reinterpret_cast<struct sockaddr*>(&dest_addr), sizeof(dest_addr)) < 0) {
         throw std::runtime_error("Failed to send ICMP request");
     }
 
+    // получение ethernet-фрейма с mac адресом
     char buffer[1024];
     struct sockaddr_ll src_addr {};
-    socklen_t addr_len = recvfrom(raw_socket.get(), buffer, sizeof(buffer), 0, reinterpret_cast<struct sockaddr*>(&src_addr), &addr_len);
+    socklen_t addr_len = sizeof(src_addr);
+    ssize_t recv_len = recvfrom(raw_socket.get(), buffer, sizeof(buffer), 0, reinterpret_cast<struct sockaddr*>(&src_addr), &addr_len);
 
+    if (recv_len <= 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            throw std::runtime_error("Timeout: no reply received");
+        } else {
+            throw std::runtime_error("recvfrom failed: " + std::string(strerror(errno)));
+        }
+    }
+
+    // извлекаем mac адрес
     auto* eth_header = reinterpret_cast<struct ethhdr*>(buffer);
+    if (eth_header->h_proto != htons(ETH_P_IP)) {
+        throw std::runtime_error("Not an IP packet");
+    }
+
     char mac_str[18];
     snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
     eth_header->h_source[0], eth_header->h_source[1], eth_header->h_source[2],
     eth_header->h_source[3], eth_header->h_source[4], eth_header->h_source[5]);
 
     return std::string(mac_str);
-    
 
 }
 
